@@ -5,7 +5,7 @@
 #   ./flop-devnet.sh fund            test FLOP for your keystore key (needed by `direct`; retries while busy)
 #   ./flop-devnet.sh credential      devnet gateway key (the CLI enrolls with its own wallet; see below)
 #   ./flop-devnet.sh ask "prompt"    one chat completion through the gateway; saves the full exchange
-#   ./flop-devnet.sh direct "prompt" one chat turn settled under your own key (flop chat)
+#   ./flop-devnet.sh direct "prompt" one call on a miner channel opened and settled under your own key
 #   ./flop-devnet.sh status          node, balance, network stats, models, your settlements
 #   ./flop-devnet.sh mcp <tool> [json-args]   call any tool on the hosted FLOP MCP server
 #   ./flop-devnet.sh all "prompt"    init (if needed) -> fund -> credential -> ask -> status
@@ -20,7 +20,6 @@ GATEWAY="${FLOP_GATEWAY_URL:-https://api.flop.network/v1}"
 MCP_URL="${FLOP_MCP_URL:-https://mcp.flop.network/mcp}"
 EXPLORER="${FLOP_EXPLORER_URL:-https://explorer.devnet.flop.network}"
 MODEL="${FLOP_MODEL:-qwen/qwen2.5-0.5b-instruct}"                # gateway model id
-REGISTRY_MODEL="${FLOP_REGISTRY_MODEL:-Qwen/Qwen2.5-0.5B-Instruct}" # on-chain registry id (flop chat)
 GENESIS="0x99c172c095340ace980631f9123544c6bebd4839f3437e463533422d8be2d631"
 
 die()  { echo "error: $*" >&2; exit 1; }
@@ -96,9 +95,21 @@ cmd_ask() {
     "$MODEL" "$prompt" > "$run/request.json"
   # The key goes to curl through a header file, so it never appears in the process list.
   ( umask 077; printf 'Authorization: Bearer %s\n' "$(cat "$FLOP_HOME/gateway.key")" > "$run/.auth" )
-  curl -sS -D "$run/headers.txt" -o "$run/response.json" -w '%{http_code}' \
-       -H @"$run/.auth" -H 'Content-Type: application/json' \
-       --data @"$run/request.json" "$GATEWAY/chat/completions" > "$run/http_code" || true
+  # 429 "gateway channel pool is full" is common on a busy devnet: honour Retry-After and try again.
+  local i code tries="${FLOP_ASK_TRIES:-60}" wait
+  for i in $(seq 1 "$tries"); do
+    code=$(curl -sS -D "$run/headers.txt" -o "$run/response.json" -w '%{http_code}' \
+         -H @"$run/.auth" -H 'Content-Type: application/json' \
+         --data @"$run/request.json" "$GATEWAY/chat/completions" || echo 000)
+    printf '%s' "$code" > "$run/http_code"
+    case "$code" in 429|502|503|000) ;; *) break ;; esac
+    wait=$(python3 -I -c 'import json,sys
+try: print(int(json.load(open(sys.argv[1])).get("retry_after") or 0))
+except Exception: print(0)' "$run/response.json")
+    [ "$wait" -ge 30 ] || wait=30   # "channel pool is full" says retry-after: 1, but 1 s just trips the rate limit
+    echo "$(date -u +%H:%M:%S)Z gateway HTTP $code ($(head -c 120 "$run/response.json" | tr -d '\n')); retry $i/$tries in ${wait}s"
+    [ "$i" -lt "$tries" ] && sleep "$wait"
+  done
   rm -f "$run/.auth"
   python3 -I - "$run" <<'PY'
 import json, sys, pathlib
@@ -122,9 +133,24 @@ else:
 PY
 }
 
+# Direct path: a channel with a miner, opened and settled under YOUR keystore key (flop session run).
+# It needs a live signed offer from a miner; tries each miner that quotes the model on the gateway.
 cmd_direct() {
-  local prompt="${1:-Say hello from FLOP devnet in one sentence.}"
-  signed_flop chat "$prompt" --model "$REGISTRY_MODEL" --max-flop "${FLOP_MAX_FLOP:-1}" --json
+  local prompt="${1:-Say hello from FLOP devnet in one sentence.}" miners m out
+  miners=$(curl -sS "$GATEWAY/models" | python3 -I -c '
+import json, sys
+want = sys.argv[1]
+for m in json.load(sys.stdin)["data"]:
+    if m["id"] == want:
+        for s in (m.get("x-flop") or {}).get("price_sources") or []: print(s["miner_address"])' "$MODEL")
+  [ -n "$miners" ] || die "no miner quotes $MODEL on the gateway right now"
+  for m in $miners; do
+    echo "== miner $m"
+    if out=$(signed_flop session run --miner "$m" --model "$MODEL" --prompt "$prompt" \
+               --max-flop "${FLOP_MAX_FLOP:-2}" --via offer --json 2>&1); then echo "$out"; return 0; fi
+    printf '%s\n' "$out" | grep -E '"(code|message)"' || printf '%s\n' "$out" | tail -n 3
+  done
+  die "no miner had a live signed offer for $MODEL within ${FLOP_MAX_FLOP:-2} FLOP"
 }
 
 cmd_mcp() {
