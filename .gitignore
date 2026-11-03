@@ -1,0 +1,14 @@
+# secrets must never be committed
+.flop-devnet/
+*.key
+*.pw
+.pw
+agent.json
+*keystore*.json
+.env
+.env.*
+runs/
+
+# local
+.DS_Store
+node_modules/
