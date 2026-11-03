@@ -9,10 +9,10 @@ One bash script that takes you from nothing to an inference call on the [FLOP de
 | Step | Command | What happens |
 |---|---|---|
 | 1 | `./flop-devnet.sh init` | Generates a new **sr25519** agent key in an encrypted Polkadot keystore at `~/.flop-devnet/` (outside the repo). The password is random and stored in a file only you can read. |
-| 2 | `./flop-devnet.sh fund` | Requests test FLOP from `faucet.flop.network`. The CLI checks the faucet's and the RPC's chain identity first. Retries every 60 s while the faucet is busy. |
-| 3 | `./flop-devnet.sh credential` | `flop agent credential`: a wallet-signed request for a devnet gateway API key. The key is saved to `~/.flop-devnet/gateway.key` (mode 600) and never printed. |
+| 2 | `./flop-devnet.sh fund` | Requests test FLOP for **your keystore key** from `faucet.flop.network` (needed for `direct`). The CLI checks the faucet's and the RPC's chain identity first. Retries every 60 s while the faucet is busy. |
+| 3 | `./flop-devnet.sh credential` | `flop agent credential`: a wallet-signed enrollment for a devnet gateway API key. **The CLI uses its own wallet for this, not your keystore** (see Known issues). Retries while the faucet is busy. The key is saved to `~/.flop-devnet/gateway.key` (mode 600) and never printed. |
 | 4 | `./flop-devnet.sh ask "prompt"` | One OpenAI-style chat completion to `api.flop.network/v1/chat/completions`. Request, response headers and body are saved under `~/.flop-devnet/runs/<timestamp>/`. |
-| 5 | `./flop-devnet.sh status` | Node health, your balance, **settlements where your key is the agent**, the latest network settlement, network stats and the models the gateway serves. |
+| 5 | `./flop-devnet.sh status` | Node health; balance and **settlements** for your keystore key and for the CLI's enrollment wallet; the latest network settlement; network stats; the models the gateway serves. |
 
 `./flop-devnet.sh all "prompt"` runs steps 1 to 5 in order.
 
@@ -60,15 +60,22 @@ All optional, as environment variables:
 Checked against the live devnet:
 
 - `init`: key generation, encrypted keystore, owner-only files.
-- `status`: the node reports `FLOP Devnet`, version `1.1.0-13ff7e2c334`. Balance, settlement lookups by agent, network stats and the model list all return live data. The gateway serves one model, `qwen/qwen2.5-0.5b-instruct`, priced by 3 miners.
+- `status`: the node reports `FLOP Devnet`, version `1.1.0-13ff7e2c334`. Balance, settlement lookups by agent, network stats and the model list all return live data. The gateway serves one model, `qwen/qwen2.5-0.5b-instruct`, with price quotes from 3 miners (quotes, not a count of miners online).
 - `mcp`: tool calls against the hosted server.
-- `fund`: the retry loop and error handling. The faucet's `/health` is fine, but every `/fund` request currently returns `503 IP classification unavailable; retry later`.
+- `fund` and `credential`: the retry loops and error handling. The faucet's `/health` is fine, but every `/fund` request currently returns `503 IP classification unavailable; retry later`, and `agent credential` fails on the same call.
 
 Not verified yet, because the faucet outage blocks them:
 
-- `credential`, `ask` and `direct` need a funded key.
+- `ask` and `direct` need a gateway key or a funded key.
 
 This section will be updated with a real run, including the settlement it produces, once the faucet is back.
+
+## Known issues in `@flop-labs/cli` 0.4.0
+
+Found by reading the published CLI source (`dist/cli.js`, functions `enrollmentWallet`, `walletEnrollment`, `publicDevnetCredential`) and the indexer:
+
+1. **`agent credential` ignores `--keystore`.** It always enrolls with a separate sr25519 wallet that it creates on first use at `~/.flop/devnet-enroll-wallet.json`. That file stores the wallet's **12-word mnemonic in plain text** (mode 600). The CLI also funds that wallet from the faucet itself, and caches the gateway key in `~/.flop/devnet-wallet-agent-key.json`. The file is written before the faucet call, so it exists even when enrollment fails. Devnet only, but never reuse that mnemonic for anything.
+2. **Gateway runs don't settle under your address.** Of the 251 settlements indexed so far, 166 have the same agent, `5GsXb3TmNGixuEsbtixqHnqWr9UQJ2M8bkqBQWteNekgF98S`, which looks like the hosted gateway's own account. If you want spend tied to your key, use `direct` (`flop chat`, signed by your keystore) rather than the hosted gateway.
 
 ## What the hosted MCP itself says about receipts
 
@@ -78,7 +85,7 @@ This section will be updated with a real run, including the settlement it produc
 
 - Keys, the keystore password and the gateway key live in `~/.flop-devnet/` (directory mode 700, files 600), never in this repo. `.gitignore` also blocks `*.key`, keystores and `.env*` in case of mistakes.
 - The gateway key is passed to `curl` through a temporary header file, deleted right after the call, so it never appears in the process list or in shell history.
-- The script never prints a mnemonic: keys are generated straight into an encrypted keystore.
+- The script never prints a mnemonic: your key is generated straight into an encrypted keystore. The CLI's own enrollment wallet is the exception (see Known issues), and the script warns about it.
 
 ## Links
 

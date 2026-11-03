@@ -2,8 +2,8 @@
 # flop-devnet.sh — from zero to a settled inference call on FLOP devnet, using the official CLI.
 #
 #   ./flop-devnet.sh init            new sr25519 agent key in an encrypted keystore (random password)
-#   ./flop-devnet.sh fund            test FLOP from the faucet (retries while the faucet is busy)
-#   ./flop-devnet.sh credential      devnet gateway key for your agent (wallet-signed)
+#   ./flop-devnet.sh fund            test FLOP for your keystore key (needed by `direct`; retries while busy)
+#   ./flop-devnet.sh credential      devnet gateway key (the CLI enrolls with its own wallet; see below)
 #   ./flop-devnet.sh ask "prompt"    one chat completion through the gateway; saves the full exchange
 #   ./flop-devnet.sh direct "prompt" one chat turn settled under your own key (flop chat)
 #   ./flop-devnet.sh status          node, balance, network stats, models, your settlements
@@ -65,13 +65,27 @@ cmd_fund() {
   flop balance "$a" --json
 }
 
+# NOTE (CLI 0.4.0): `agent credential` ignores --keystore. It enrolls with its OWN sr25519 wallet,
+# created on first use at ~/.flop/devnet-enroll-wallet.json with the 12-word mnemonic in PLAIN TEXT
+# (mode 600), funds that wallet from the faucet itself, and caches the gateway key in
+# ~/.flop/devnet-wallet-agent-key.json. Devnet-only, but never reuse that mnemonic anywhere.
+ENROLL_WALLET="$HOME/.flop/devnet-enroll-wallet.json"
+enroll_address() { [ -f "$ENROLL_WALLET" ] && python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["address"])' "$ENROLL_WALLET"; }
+
 cmd_credential() {
-  local key
-  signed_flop agent credential --json
-  key=$(signed_flop agent credential --print-key | tail -n 1 | tr -d '[:space:]')   # reuses the key above
-  [ -n "$key" ] || die "no gateway key returned"
+  local key out tries="${FLOP_FUND_TRIES:-30}" wait="${FLOP_FUND_WAIT:-60}" i
+  for i in $(seq 1 "$tries"); do
+    if out=$(flop agent credential --json 2>&1); then echo "$out"; break; fi
+    echo "$(date -u +%H:%M:%S)Z credential attempt $i/$tries: $(printf '%s' "$out" | tr -d '\n' | tr -s ' ' | cut -c1-170)"
+    [ "$i" -lt "$tries" ] || die "credential still failing after $tries attempts; try again later"
+    sleep "$wait"
+  done
+  key=$(flop agent credential --print-key | tail -n 1 | tr -d '[:space:]')   # reuses the cached key
+  case "$key" in flop_*) ;; *) die "no gateway key returned" ;; esac
   umask 077; printf '%s' "$key" > "$FLOP_HOME/gateway.key"; chmod 600 "$FLOP_HOME/gateway.key"
   echo "gateway key saved to $FLOP_HOME/gateway.key (owner-only; never commit, paste or screenshot it)"
+  echo "enrollment wallet (created by the CLI, not your keystore): $(enroll_address)"
+  echo "warning: $ENROLL_WALLET holds that wallet's mnemonic in plain text. Devnet only; never reuse it."
 }
 
 cmd_ask() {
@@ -148,13 +162,19 @@ for s in rows:
 }
 
 cmd_status() {
-  local a=""
+  local a="" e=""
   [ -f "$FLOP_HOME/address" ] && a=$(cat "$FLOP_HOME/address")
   echo "== node";    flop health --json || true
   echo "   devnet genesis $GENESIS (faucet requests verify it before sending)"
   if [ -n "$a" ]; then
-    echo "== balance $a"; flop balance "$a" --json || true
-    echo "== settlements where agent = $a"; settlements "{\"agent\":\"$a\",\"limit\":5}" || true
+    echo "== your keystore key $a"; flop balance "$a" --json || true
+    echo "   settlements where agent = this key (direct / flop chat runs)"; settlements "{\"agent\":\"$a\",\"limit\":5}" || true
+  fi
+  e=$(enroll_address || true)
+  if [ -n "$e" ]; then
+    echo "== CLI enrollment wallet $e (used by agent credential)"; flop balance "$e" --json || true
+    echo "   settlements where agent = this wallet"; settlements "{\"agent\":\"$e\",\"limit\":5}" || true
+    echo "   note: hosted-gateway runs may settle under a shared gateway account, not under either address"
   fi
   echo "== latest settlement on the network"; settlements '{"limit":1}' || true
   echo "== network"; cmd_mcp flop_get_stats '{}' || true
@@ -163,7 +183,7 @@ cmd_status() {
 import json, sys
 for m in json.load(sys.stdin)["data"]:
     src = (m.get("x-flop") or {}).get("price_sources") or []
-    print("  -", m["id"], "| registry", (m.get("x-flop") or {}).get("registry_model"), "| priced by", len(src), "miners")'
+    print("  -", m["id"], "| registry", (m.get("x-flop") or {}).get("registry_model"), "| price quotes from", len(src), "miners (not the same as miners online)")'
   echo "== explorer: $EXPLORER"
 }
 
